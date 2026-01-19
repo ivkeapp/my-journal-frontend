@@ -7,7 +7,7 @@ import { createBrowserRouter } from 'react-router-dom';
 import { ProtectedRoute, PublicOnlyRoute, AuthRedirect } from '@/components/RouteGuards';
 import LoginPage from '@/pages/LoginPage';
 import RegisterPage from '@/pages/RegisterPage';
-import JournalPage from '@/pages/JournalPage';
+import { JournalListPage, DraftsPage, JournalEditorPage } from '@/features/journal';
 
 export const router = createBrowserRouter([
   // Public routes (redirect to /journal if already authenticated)
@@ -33,7 +33,31 @@ export const router = createBrowserRouter([
     path: '/journal',
     element: (
       <ProtectedRoute>
-        <JournalPage />
+        <JournalListPage />
+      </ProtectedRoute>
+    ),
+  },
+  {
+    path: '/journal/new',
+    element: (
+      <ProtectedRoute>
+        <JournalEditorPage />
+      </ProtectedRoute>
+    ),
+  },
+  {
+    path: '/journal/:id',
+    element: (
+      <ProtectedRoute>
+        <JournalEditorPage />
+      </ProtectedRoute>
+    ),
+  },
+  {
+    path: '/drafts',
+    element: (
+      <ProtectedRoute>
+        <DraftsPage />
       </ProtectedRoute>
     ),
   },
