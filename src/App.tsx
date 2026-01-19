@@ -1,16 +1,31 @@
+/**
+ * App Root Component
+ * Sets up routing and auth initialization
+ * Router only renders after auth state is determined to prevent flash
+ */
+
+import { useEffect } from 'react';
+import { RouterProvider } from 'react-router-dom';
+import { useAuthStore, useIsInitialized } from '@/auth';
+import { LoadingOverlay } from '@/components/ui/spinner';
+import { router } from '@/router';
+
 function App() {
-  return (
-    <div className="min-h-screen bg-gray-100 flex items-center justify-center">
-      <div className="text-center p-8 bg-white rounded-lg shadow-lg">
-        <h1 className="text-3xl font-bold text-gray-900 mb-4">
-          Frontend Ready
-        </h1>
-        <p className="text-gray-600">
-          React + Vite + TypeScript + Tailwind CSS
-        </p>
-      </div>
-    </div>
-  );
+  const isInitialized = useIsInitialized();
+  const initialize = useAuthStore((state) => state.initialize);
+  
+  // Initialize auth on mount
+  useEffect(() => {
+    initialize();
+  }, [initialize]);
+  
+  // Don't render router until auth state is determined
+  // This prevents any flash of wrong page
+  if (!isInitialized) {
+    return <LoadingOverlay message="Loading..." />;
+  }
+  
+  return <RouterProvider router={router} />;
 }
 
-export default App
+export default App;
