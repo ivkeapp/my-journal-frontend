@@ -4,47 +4,21 @@
  */
 
 import { Link } from 'react-router-dom';
-import { useAuth } from '@/auth';
 import { useDrafts, useJournalCounts } from '../hooks';
 import { EntryList } from '../components';
 import { Button } from '@/components/ui/button';
 import { Spinner } from '@/components/ui/spinner';
 import { Alert, AlertDescription } from '@/components/ui/alert';
-import { BookOpen, Plus, FileEdit, LogOut } from 'lucide-react';
+import { AppHeader } from '@/components/layout';
+import { Plus, FileEdit } from 'lucide-react';
 
 export function DraftsPage() {
-  const { user, logout } = useAuth();
   const { data, isLoading, error } = useDrafts();
   const { data: countsData } = useJournalCounts();
 
-  const handleLogout = async () => {
-    await logout();
-  };
-
   return (
     <div className="min-h-screen bg-gray-50">
-      {/* Header */}
-      <header className="bg-white border-b border-gray-200 sticky top-0 z-10">
-        <div className="max-w-3xl mx-auto px-4 py-4">
-          <div className="flex items-center justify-between">
-            <div className="flex items-center gap-3">
-              <div className="w-8 h-8 bg-gray-900 rounded-lg flex items-center justify-center">
-                <BookOpen className="w-4 h-4 text-white" />
-              </div>
-              <span className="font-semibold text-gray-900">My Journal</span>
-            </div>
-
-            <div className="flex items-center gap-2">
-              <span className="text-sm text-gray-500 hidden sm:inline">
-                {user?.username || user?.email}
-              </span>
-              <Button variant="ghost" size="sm" onClick={handleLogout}>
-                <LogOut className="w-4 h-4" />
-              </Button>
-            </div>
-          </div>
-        </div>
-      </header>
+      <AppHeader />
 
       <main className="max-w-3xl mx-auto px-4 py-6">
         {/* Navigation tabs */}
