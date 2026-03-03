@@ -60,15 +60,20 @@ export function JournalEditorPage() {
     window.history.replaceState(null, '', `/journal/${newId}`);
   }, []);
 
-  // Autosave hook - now returns status internally
-  const { saveNow, saveStatus, lastSavedAt, isSaving, isDirty } = useAutosave({
+  // Stop autosave while a publish / delete operation is in progress so we
+  // never create a new draft entry concurrently with those actions.
+  const autosaveEnabled =
+    !publishDraft.isPending && !deleteEntry.isPending && !deleteDraft.isPending;
+
+  // Autosave hook
+  const { saveNow, cancelPendingSave, saveStatus, lastSavedAt, isSaving, isDirty } = useAutosave({
     id: currentId,
     title,
     content,
     status: entryStatus,
     debounceMs: 1000,
     onCreated: handleCreated,
-    enabled: true,
+    enabled: autosaveEnabled,
     isInitialized: isDataInitialized,
   });
 
@@ -79,20 +84,26 @@ export function JournalEditorPage() {
 
   // Handle publish
   const handlePublish = useCallback(async () => {
+    // Cancel any pending autosave timer immediately — we are taking over
+    // the save lifecycle from this point forward. Without this, a debounce
+    // timer scheduled just before the user clicked Publish could fire
+    // concurrently with our explicit save below and create a duplicate draft.
+    cancelPendingSave();
+
     if (!currentId) {
-      // Need to save first to get an ID
+      // New entry: validate, create the draft, then publish atomically.
       if (!title.trim() && !content.trim()) {
         toast.error('Cannot publish empty entry');
         return;
       }
 
       try {
-        // Create draft first
+        // Create draft first to obtain a persisted ID
         const result = await saveDraft.mutateAsync({
           title: title.trim() || 'Untitled',
           content,
         });
-        
+
         // Then publish it
         await publishDraft.mutateAsync(result.draft.id);
         toast.success('Entry published!');
@@ -105,11 +116,13 @@ export function JournalEditorPage() {
     }
 
     try {
-      // Save any pending changes first
+      // Existing entry: flush any unsaved changes before publishing.
+      // saveNow() also cancels a pending debounce timer (redundant here, but
+      // harmless) and awaits the network request before we publish.
       if (isDirty) {
         await saveNow();
       }
-      
+
       await publishDraft.mutateAsync(currentId);
       setEntryStatus('published');
       toast.success('Entry published!');
@@ -118,7 +131,7 @@ export function JournalEditorPage() {
       toast.error('Failed to publish');
       console.error('Publish error:', error);
     }
-  }, [currentId, title, content, isDirty, saveNow, saveDraft, publishDraft, navigate]);
+  }, [currentId, title, content, isDirty, saveNow, cancelPendingSave, saveDraft, publishDraft, navigate]);
 
   // Handle delete
   const handleDelete = useCallback(async () => {

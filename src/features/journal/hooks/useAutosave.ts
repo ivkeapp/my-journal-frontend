@@ -1,6 +1,32 @@
 /**
  * Autosave Hook
- * Debounced autosave with proper cancellation and race condition handling
+ * Debounced autosave with proper cancellation and race condition handling.
+ *
+ * Root-cause fix (see commit message for full analysis):
+ *
+ * Previous bug: `performSave` was a `useCallback` that captured `saveDraft` and
+ * `updateEntry` mutation objects as dependencies. TanStack Query creates a new
+ * mutation-object reference every time `isPending` toggles (true → false after
+ * each save). This caused `performSave` to be recreated, which caused the debounce
+ * `useEffect` (that listed `performSave` as a dep) to re-fire immediately after
+ * every completed save. The effect then scheduled a new debounce timer, and the
+ * concurrent `finally`-block timer from the just-finished save also fired — two
+ * concurrent `POST /drafts` requests without an `id` = two new draft records every
+ * save cycle. The same mutation-state oscillation drove `isSaving` (derived from
+ * `saveDraft.isPending`) to flicker, causing button flickering.
+ *
+ * Fix:
+ *  1. `performSave` is now `useCallback(fn, [])` — a truly stable reference.
+ *     All live values (title, content, status, mutations, onCreated) are read from
+ *     refs that are kept up-to-date via a no-dep sync effect.
+ *  2. The debounce effect therefore only re-runs on actual content/control changes:
+ *     `[title, content, status, enabled, isInitialized, debounceMs]`.
+ *  3. The `finally`-block recursive timeout is removed entirely. If the user keeps
+ *     typing while a save is in progress, the debounce effect will schedule its own
+ *     timer once the latest `title`/`content` change arrives.
+ *  4. `isSaving` is now local state controlled directly by `performSave`, not
+ *     derived from `saveDraft.isPending`, so the UI never flickers from internal
+ *     query-state transitions.
  */
 
 import { useRef, useCallback, useEffect, useState } from 'react';
@@ -29,6 +55,8 @@ interface AutosaveOptions {
 interface AutosaveReturn {
   /** Trigger immediate save */
   saveNow: () => Promise<void>;
+  /** Cancel any pending debounce timer without saving */
+  cancelPendingSave: () => void;
   /** Current save status */
   saveStatus: SaveStatus;
   /** Last saved timestamp */
@@ -49,52 +77,92 @@ export function useAutosave({
   enabled = true,
   isInitialized = false,
 }: AutosaveOptions): AutosaveReturn {
-  const saveDraft = useSaveDraft();
-  const updateEntry = useUpdateEntry();
-  
-  // Internal state
+  // Instantiate mutations once — we keep them current via refs below.
+  const saveDraftMutation = useSaveDraft();
+  const updateEntryMutation = useUpdateEntry();
+
+  // ---------------------------------------------------------------------------
+  // State visible to the UI
+  // ---------------------------------------------------------------------------
   const [saveStatus, setSaveStatus] = useState<SaveStatus>('idle');
   const [lastSavedAt, setLastSavedAt] = useState<Date | null>(null);
-  
-  // Track the last saved values to detect changes
+  // Use local state for isSaving so it is NOT driven by saveDraft.isPending.
+  // Driving it from mutation state caused the original flicker: every completed
+  // save toggled isPending → new performSave reference → effect re-run → new timer.
+  const [isSaving, setIsSaving] = useState(false);
+
+  // ---------------------------------------------------------------------------
+  // Stable refs — updated every render so performSave never reads stale values
+  // ---------------------------------------------------------------------------
   const lastSavedRef = useRef<{ title: string; content: string } | null>(null);
   const timeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const pendingSaveRef = useRef<{ title: string; content: string } | null>(null);
   const currentIdRef = useRef<number | null>(id);
-  const isSavingRef = useRef(false); // Lock to prevent concurrent saves
-  
-  // Keep track of current ID
+  const isSavingRef = useRef(false); // concurrency lock
+
+  // Live-value refs (updated each render, no extra state changes)
+  const titleRef = useRef(title);
+  const contentRef = useRef(content);
+  const statusRef = useRef(status);
+  const enabledRef = useRef(enabled);
+  const isInitializedRef = useRef(isInitialized);
+  const onCreatedRef = useRef(onCreated);
+  const debounceRef = useRef(debounceMs);
+  const saveDraftMutationRef = useRef(saveDraftMutation);
+  const updateEntryMutationRef = useRef(updateEntryMutation);
+
+  // Sync all live values into refs after every render (pure ref mutation, no
+  // re-renders triggered).
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  useEffect(() => {
+    titleRef.current = title;
+    contentRef.current = content;
+    statusRef.current = status;
+    enabledRef.current = enabled;
+    isInitializedRef.current = isInitialized;
+    onCreatedRef.current = onCreated;
+    debounceRef.current = debounceMs;
+    saveDraftMutationRef.current = saveDraftMutation;
+    updateEntryMutationRef.current = updateEntryMutation;
+  }); // intentionally no deps — runs after every render
+
+  // Keep currentIdRef in sync with the id prop
   useEffect(() => {
     currentIdRef.current = id;
   }, [id]);
 
-  // Initialize lastSavedRef when data is first loaded
+  // Initialize lastSavedRef exactly once when data has been loaded.
+  // Intentionally omit title/content from deps: we only want to capture the
+  // values at the moment isInitialized first becomes true.
   useEffect(() => {
     if (isInitialized && lastSavedRef.current === null) {
-      lastSavedRef.current = { title, content };
-      // Don't show any status on initial load - status only matters after user edits
-      // Keep status as 'idle' until user makes changes
+      lastSavedRef.current = {
+        title: titleRef.current,
+        content: contentRef.current,
+      };
     }
-  }, [isInitialized, title, content]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isInitialized]);
 
-  // Check if there are unsaved changes
-  const isDirty = 
+  // ---------------------------------------------------------------------------
+  // isDirty — computed inline from current render values vs last snapshot
+  // ---------------------------------------------------------------------------
+  const isDirty =
     lastSavedRef.current !== null &&
     (title !== lastSavedRef.current.title || content !== lastSavedRef.current.content);
 
-  // For published entries, track unsaved status without autosaving
+  // Track unsaved status for published entries (manual save only, no autosave)
   useEffect(() => {
     if (!isInitialized || status !== 'published') return;
-    
     if (isDirty) {
       setSaveStatus('unsaved');
     } else if (saveStatus === 'unsaved') {
-      // Only reset to idle if we were in unsaved state (don't reset 'saved')
       setSaveStatus('idle');
     }
   }, [isDirty, isInitialized, status, saveStatus]);
 
-  // Clear any pending timeout
+  // ---------------------------------------------------------------------------
+  // Stable clearPendingTimeout — deps: [] so it never changes reference
+  // ---------------------------------------------------------------------------
   const clearPendingTimeout = useCallback(() => {
     if (timeoutRef.current) {
       clearTimeout(timeoutRef.current);
@@ -102,107 +170,144 @@ export function useAutosave({
     }
   }, []);
 
-  // Perform the actual save
+  // ---------------------------------------------------------------------------
+  // performSave — stable reference (deps: []).
+  //
+  // All live values are read from refs, so this function never needs to be
+  // recreated. This is the key fix: previously, `performSave` captured
+  // `saveDraft`/`updateEntry` in its closure deps, causing it to be recreated
+  // on every mutation-state change, which in turn triggered the debounce effect
+  // to re-fire and schedule a new, redundant save timer.
+  // ---------------------------------------------------------------------------
   const performSave = useCallback(async (saveTitle: string, saveContent: string) => {
-    // Prevent concurrent saves (race condition that creates duplicate drafts)
+    // Concurrency guard — only one save in flight at a time.
+    // If a save is already running, do nothing here: the debounce effect will
+    // schedule another timer when the user's next keystroke arrives (because
+    // title/content will have changed again relative to lastSavedRef).
     if (isSavingRef.current) {
-      // Queue another save after current one finishes
-      pendingSaveRef.current = { title: saveTitle, content: saveContent };
+      console.log('[Autosave] Save already in progress, skipping');
       return;
     }
-    
+
     isSavingRef.current = true;
+    setIsSaving(true);
     setSaveStatus('saving');
 
     try {
       const currentId = currentIdRef.current;
-      
-      if (status === 'draft') {
-        // For drafts, use the draft endpoint
-        const result = await saveDraft.mutateAsync({
+      const currentStatus = statusRef.current;
+
+      if (currentStatus === 'draft') {
+        console.log('[Autosave] Saving draft', { id: currentId, title: saveTitle });
+        const result = await saveDraftMutationRef.current.mutateAsync({
           id: currentId ?? undefined,
           title: saveTitle,
           content: saveContent,
         });
 
-        // If this was a new draft, notify parent of the new ID
+        // For a brand-new entry: store the server-assigned ID and notify parent.
+        // The parent updates the URL so subsequent autosaves correctly pass the
+        // id and hit PUT (update) instead of POST (create).
         if (currentId === null && result.draft.id) {
           currentIdRef.current = result.draft.id;
-          onCreated?.(result.draft.id);
+          onCreatedRef.current?.(result.draft.id);
+          console.log('[Autosave] New draft created with id', result.draft.id);
         }
-      } else {
-        // For published entries, use the update endpoint
-        if (currentId !== null) {
-          await updateEntry.mutateAsync({
-            id: currentId,
-            data: { title: saveTitle, content: saveContent },
-          });
-        }
+      } else if (currentId !== null) {
+        // Published entries: update via the general entry endpoint
+        console.log('[Autosave] Updating published entry', { id: currentId });
+        await updateEntryMutationRef.current.mutateAsync({
+          id: currentId,
+          data: { title: saveTitle, content: saveContent },
+        });
       }
 
-      // Update last saved reference
+      // Mark this content as "saved baseline" — isDirty will be false until
+      // the user types something different.
       lastSavedRef.current = { title: saveTitle, content: saveContent };
       setSaveStatus('saved');
       setLastSavedAt(new Date());
+      console.log('[Autosave] Save completed successfully', { at: new Date().toISOString() });
     } catch (error) {
-      if (error instanceof Error && error.name !== 'AbortError') {
+      // AbortError is expected when requests are cancelled; treat everything
+      // else as a visible error.
+      const isAbort = error instanceof Error && error.name === 'AbortError';
+      if (!isAbort) {
         setSaveStatus('error');
-        console.error('Autosave failed:', error);
+        console.error('[Autosave] Save failed:', error);
       }
     } finally {
       isSavingRef.current = false;
-      
-      // Check if there's a pending save that was queued while we were saving
-      const pending = pendingSaveRef.current;
-      if (pending && (pending.title !== lastSavedRef.current?.title || pending.content !== lastSavedRef.current?.content)) {
-        pendingSaveRef.current = null;
-        // Use setTimeout to avoid deep recursion
-        setTimeout(() => performSave(pending.title, pending.content), 100);
-      }
+      setIsSaving(false);
+      // NOTE: No recursive/queued save here. If the user has continued typing
+      // while this save was running, `title`/`content` props will have changed
+      // relative to the new `lastSavedRef`. The debounce effect (watching
+      // [title, content, ...]) will have already scheduled a new timer for
+      // the latest content — no extra work needed here.
     }
-  }, [status, saveDraft, updateEntry, onCreated]);
+  }, []); // stable — reads all values through refs
 
-  // Immediate save function (exposed to parent)
+  // ---------------------------------------------------------------------------
+  // saveNow — immediate save bypassing debounce (exposed to parent)
+  // ---------------------------------------------------------------------------
   const saveNow = useCallback(async () => {
     clearPendingTimeout();
-    
-    if (!isDirty) return;
-    
-    await performSave(title, content);
-  }, [clearPendingTimeout, isDirty, performSave, title, content]);
 
-  // Effect to handle debounced autosave
+    // Re-compute dirty from refs so we don't close over stale isDirty
+    const dirty =
+      lastSavedRef.current !== null &&
+      (titleRef.current !== lastSavedRef.current.title ||
+        contentRef.current !== lastSavedRef.current.content);
+
+    if (!dirty) return;
+
+    await performSave(titleRef.current, contentRef.current);
+  }, [clearPendingTimeout, performSave]); // both stable
+
+  // ---------------------------------------------------------------------------
+  // Debounce effect — the ONLY place a save timer is scheduled.
+  //
+  // Dependencies: [title, content, status, enabled, isInitialized, debounceMs]
+  //
+  // Notably absent: `performSave` and `clearPendingTimeout` — they are stable
+  // (`useCallback(fn, [])`) so including them would be safe, but omitting them
+  // keeps the intent clear: this effect fires ONLY on actual content changes.
+  // ---------------------------------------------------------------------------
   useEffect(() => {
-    // Don't autosave if not enabled or not initialized
     if (!enabled || !isInitialized) return;
-    
-    // Don't autosave published entries - they require manual save
     if (status === 'published') return;
-    
-    // Don't autosave if nothing has changed
-    if (!isDirty) return;
 
-    // Mark as unsaved
+    // Compute dirty inline using the ref snapshot so we do not depend on the
+    // `isDirty` computed value (which could change from ref mutations without
+    // triggering this effect).
+    const dirty =
+      lastSavedRef.current !== null &&
+      (title !== lastSavedRef.current.title || content !== lastSavedRef.current.content);
+
+    if (!dirty) return;
+
     setSaveStatus('unsaved');
 
-    // Clear existing timeout
+    // Cancel any previously scheduled timer before starting a new one.
     clearPendingTimeout();
 
-    // Store the pending save values
-    pendingSaveRef.current = { title, content };
-
-    // Set new timeout
     timeoutRef.current = setTimeout(() => {
-      const pending = pendingSaveRef.current;
-      if (pending) {
-        performSave(pending.title, pending.content);
-      }
+      // Read the latest values at fire-time from refs, not from the closure.
+      // This is safe because we keep refs in sync every render (the no-dep
+      // sync effect above). By the time this timer fires (≥debounceMs later),
+      // the refs will reflect the most recent user input.
+      console.log('[Autosave] Debounce timer fired');
+      performSave(titleRef.current, contentRef.current);
     }, debounceMs);
 
     return () => {
       clearPendingTimeout();
     };
-  }, [title, content, status, enabled, isInitialized, isDirty, debounceMs, clearPendingTimeout, performSave]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [title, content, status, enabled, isInitialized, debounceMs]);
+  // ↑ clearPendingTimeout and performSave intentionally omitted — both are
+  //   stable ([] deps) so adding them would cause no extra runs, but excluding
+  //   them makes the contract explicit: only input changes trigger autosave.
 
   // Cleanup on unmount
   useEffect(() => {
@@ -211,11 +316,18 @@ export function useAutosave({
     };
   }, [clearPendingTimeout]);
 
+  // Expose timer cancellation so callers (e.g. handlePublish) can prevent a
+  // queued autosave from racing with a manual operation.
+  const cancelPendingSave = useCallback(() => {
+    clearPendingTimeout();
+  }, [clearPendingTimeout]);
+
   return {
     saveNow,
+    cancelPendingSave,
     saveStatus,
     lastSavedAt,
-    isSaving: saveDraft.isPending || updateEntry.isPending,
+    isSaving,
     isDirty,
   };
 }
