@@ -33,7 +33,12 @@ export function EntryToolbar({
   canPublish,
 }: EntryToolbarProps) {
   const navigate = useNavigate();
+  // Heavy operations (explicit publish / delete) block all buttons.
+  // Background autosave (isSaving) intentionally does NOT block the Publish
+  // button — handlePublish calls cancelPendingSave() first, so clicking Publish
+  // while an autosave is in flight is safe and expected.
   const isProcessing = isSaving || isPublishing || isDeleting;
+  const isPublishBlocked = isPublishing || isDeleting; // autosave does not block publish
 
   const handleBack = () => {
     if (entryStatus === 'draft') {
@@ -96,7 +101,7 @@ export function EntryToolbar({
           <Button
             size="sm"
             onClick={onPublish}
-            disabled={isProcessing || !canPublish}
+            disabled={isPublishBlocked || !canPublish}
             className="gap-2"
           >
             {isPublishing ? (

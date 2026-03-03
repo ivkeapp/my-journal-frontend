@@ -112,7 +112,6 @@ export function useAutosave({
 
   // Sync all live values into refs after every render (pure ref mutation, no
   // re-renders triggered).
-  // eslint-disable-next-line react-hooks/exhaustive-deps
   useEffect(() => {
     titleRef.current = title;
     contentRef.current = content;
@@ -123,12 +122,28 @@ export function useAutosave({
     debounceRef.current = debounceMs;
     saveDraftMutationRef.current = saveDraftMutation;
     updateEntryMutationRef.current = updateEntryMutation;
-  }); // intentionally no deps — runs after every render
 
-  // Keep currentIdRef in sync with the id prop
-  useEffect(() => {
-    currentIdRef.current = id;
-  }, [id]);
+    // Sync currentIdRef from the prop ONLY when the prop carries a real ID.
+    //
+    // Why the guard matters:
+    //   After performSave creates a new draft it immediately writes the server-
+    //   assigned ID into currentIdRef (e.g. 42) and fires onCreated(42) which
+    //   schedules a React state update (setCurrentId(42)).
+    //   Between that moment and the render where the parent's currentId state
+    //   becomes 42, TanStack Query's onSuccess callbacks can cause several
+    //   intermediate re-renders where the `id` prop is still null.  If we
+    //   unconditionally wrote `currentIdRef.current = id` here, those renders
+    //   would reset the ref back to null and the very next autosave timer would
+    //   read null → POST /drafts with no id → another new draft record.
+    //
+    //   The guard `id !== null` means:
+    //   - A real ID from the parent always flows in (existing entries, or after
+    //     the parent state update finally processes).  ✓
+    //   - A null prop never overrides an ID that performSave already stored.  ✓
+    if (id !== null) {
+      currentIdRef.current = id;
+    }
+  }); // intentionally no deps — runs after every render
 
   // Initialize lastSavedRef exactly once when data has been loaded.
   // Intentionally omit title/content from deps: we only want to capture the
@@ -140,7 +155,6 @@ export function useAutosave({
         content: contentRef.current,
       };
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isInitialized]);
 
   // ---------------------------------------------------------------------------
